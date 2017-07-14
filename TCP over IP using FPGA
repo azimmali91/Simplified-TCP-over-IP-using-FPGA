@@ -1,0 +1,487 @@
+#include <altera_avalon_sgdma.h>
+#include   <altera_avalon_sgdma_descriptor.h>//include the sgdma descriptor
+#include   <altera_avalon_sgdma_regs.h>//include the sgdma registers
+#include   <altera_avalon_pio_regs.h>//include the PIO registers
+#include <unistd.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#include "sys/alt_stdio.h"
+#include "sys/alt_irq.h"
+#include "system.h"
+
+
+
+// Function Prototypes
+void getOct(unsigned long int a,unsigned char *oct,int len);
+
+void tx_app ();
+void rx_ethernet_isr (void *context);
+void extract_frame (unsigned char *data);
+void rx_tcp_segment (unsigned char *data, int size);
+void rx_ip_packet (unsigned char *data, int size);
+int ack_num = 0;
+int seq_num = 0;
+int ack = 0;
+
+void tx_tcp_segment (unsigned char *data, int size);
+void tx_ip_packet (unsigned char *data, int size);
+void create_frame (unsigned char *data, int size);
+void tx_ethernet_frame (unsigned char *data, int size);
+
+// Create a receive frame
+unsigned char rx_frame[1024] = { 0 };
+//unsigned char dest_add[6] = {0x17, 0x23, 0x1C, 0x00, 0xCB, 0x4A};
+//unsigned char source_add[6] = {0x17, 0x23, 0x1C, 0x01, 0xCB, 0x4A};
+//unsigned char data[12] = {'H','e', 'l', 'l', 'o',' ', 't', 'h', 'e', 'r', 'e','\0'};
+unsigned char tx_header[16] = {0x00, 0x00, 0x17, 0x23, 0x1C, 0x00, 0xCB, 0x4A, 0x17, 0x23, 0x1C, 0x01, 0xCB, 0x4A, 0x00, 0x40};
+//unsigned char * tx_frame = (unsigned char *)malloc(28 * sizeof(unsigned char));
+//memcpy(tx_frame, tx_header, 16 * sizeof(unsigned char)); // copy 4 floats from x to total[0]...total[3]
+//memcpy(tx_frame + 16, data, 11 * sizeof(unsigned char));
+//Other variables
+int in=0, print;
+
+// Create sgdma transmit and receive devices
+alt_sgdma_dev * sgdma_tx_dev;
+alt_sgdma_dev * sgdma_rx_dev;
+
+// Allocate descriptors in the descriptor_memory (onchip memory)
+alt_sgdma_descriptor tx_descriptor		__attribute__ (( section ( ".descriptor_memory" )));
+alt_sgdma_descriptor tx_descriptor_end	__attribute__ (( section ( ".descriptor_memory" )));
+
+alt_sgdma_descriptor rx_descriptor  	__attribute__ (( section ( ".descriptor_memory" )));
+alt_sgdma_descriptor rx_descriptor_end  __attribute__ (( section ( ".descriptor_memory" )));
+
+
+/********************************************************************************
+ * This program demonstrates use of the Ethernet in the DE2i-150 board.
+********************************************************************************/
+int main(void){
+
+
+	// Open the sgdma transmit device
+	sgdma_tx_dev = alt_avalon_sgdma_open ("/dev/sgdma_tx");
+	if (sgdma_tx_dev == NULL) {
+		alt_printf ("Error: could not open scatter-gather dma transmit device\n");
+		//return -1;
+	} else alt_printf ("Opened scatter-gather dma transmit device\n");
+
+	// Open the sgdma receive device
+	sgdma_rx_dev = alt_avalon_sgdma_open ("/dev/sgdma_rx");
+	if (sgdma_rx_dev == NULL) {
+		alt_printf ("Error: could not open scatter-gather dma receive device\n");
+		//return -1;
+	} else alt_printf ("Opened scatter-gather dma receive device\n");
+
+
+
+	// Set interrupts for the sgdma receive device
+	alt_avalon_sgdma_register_callback( sgdma_rx_dev, (alt_avalon_sgdma_callback) rx_ethernet_isr, 0x00000014, NULL );
+	//alt_avalon_sgdma_register_callback( sgdma_rx_dev, (alt_avalon_sgdma_callback) tx_ethernet_isr, 0x00000014, NULL );
+	// Create sgdma receive descriptor
+	alt_avalon_sgdma_construct_stream_to_mem_desc( &rx_descriptor, &rx_descriptor_end, (alt_u32 *)rx_frame, 0, 0 );
+	// Create sgdma transmit descriptor
+	//alt_avalon_sgdma_construct_mem_to_stream_desc(&tx_descriptor, &tx_descriptor_end, tx_frame, 0, 0, 1, 1, 0);
+
+
+	// Set up non-blocking transfer of sgdma receive descriptor
+	alt_avalon_sgdma_do_async_transfer( sgdma_rx_dev, &rx_descriptor );
+
+	// Set up non-blocking transfer of sgdma transmit descriptor
+	//alt_avalon_sgdma_do_async_transfer( sgdma_tx_dev, &tx_descriptor );
+	// Wait until receive descriptor transfer is complete
+		//while (alt_avalon_sgdma_check_descriptor_status(&tx_descriptor) != 0)
+		//	;
+
+
+
+	// Triple-speed Ethernet MegaCore base address
+	volatile int * tse = (int *) TSE_BASE;
+
+	// Specify the addresses of the PHY devices to be accessed through MDIO interface
+	*(tse + 0x0F) = 0x10;
+
+	// Disable read and write transfers and wait
+	*(tse + 0x02) = *(tse + 0x02) | 0x00800220;
+	while ( *(tse + 0x02) != ( *(tse + 0x02) | 0x00800220 ) );
+
+
+	//MAC FIFO Configuration
+	*(tse + 0x09) = TSE_TRANSMIT_FIFO_DEPTH-16;
+	*(tse + 0x0E ) = 0x03;
+	*(tse + 0x0D ) = 0x08;
+	*(tse +  0x07) =TSE_RECEIVE_FIFO_DEPTH-16;
+	*(tse + 0x0C ) = 0x08;
+	*(tse + 0x0B ) = 0x08;
+	*(tse + 0x0A ) = 0x00;
+	*(tse + 0x08 ) = 0x00;
+
+	// Initialize the MAC address
+	*(tse + 0x03) = 0x17231C01;
+	*(tse + 0x04) = 0x0000CB4A;
+
+	// MAC function configuration
+	*(tse + 0x05) = 1518;
+	*(tse + 0x17) = 12;
+	*(tse + 0x06) = 0xFFFF;
+	*(tse + 0x02) = 0x00800220;
+
+
+	// Software reset the PHY chip and wait
+	*(tse + 0x02) =  0x00802220;
+	while ( *(tse + 0x02) != ( 0x00800220 ) );//alt_printf( "While 1 \n" );
+
+	// Enable read and write transfers, gigabit Ethernet operation and promiscuous mode
+	
+	*(tse + 0x02) = *(tse + 0x02) | 0x0080023B;
+
+	while ( *(tse + 0x02) != ( *(tse + 0x02) | 0x0080023B)  );//alt_printf( "While 2\n" );
+
+
+	while (1) {
+
+		print=in;
+		in=IORD_ALTERA_AVALON_PIO_DATA(SWITCH_BASE) ; //read the input from the switch
+		   //switch on or switch off the LED
+		if (in==1){
+			if (print != in){
+				//alt_printf( "Switch on LED \n" );
+				IOWR_ALTERA_AVALON_PIO_DATA(LED_BASE, 0x01);
+				tx_app ();
+			}
+		}
+		else{
+			if (print != in) {
+				//alt_printf( "Switch off LED \n" );
+				IOWR_ALTERA_AVALON_PIO_DATA(LED_BASE, 0x00);
+				//printf("No of error frames %d \n",*(tse+0x22));
+			}
+		}
+	}
+
+	return 0;
+}
+
+/****************************************************************************************
+ * Subroutine to read incoming Ethernet frames
+****************************************************************************************/
+void rx_ethernet_isr (void *context)
+{
+	while (alt_avalon_sgdma_check_descriptor_status(&rx_descriptor) != 0);
+
+	alt_printf( "Received Packet \n" );
+	alt_printf( "Data: %s \n", rx_frame+16);
+	extract_frame(rx_frame);
+	//alt_printf( "again2 \n" );
+	//Include your code to show the values of the source and destination addresses of the received frame. For example:
+
+	// Wait until receive descriptor transfer is complete
+
+	// Create new receive sgdma descriptor
+	alt_avalon_sgdma_construct_stream_to_mem_desc( &rx_descriptor, &rx_descriptor_end, (alt_u32 *)rx_frame, 0, 0 );
+
+	// Set up non-blocking transfer of sgdma receive descriptor
+	alt_avalon_sgdma_do_async_transfer( sgdma_rx_dev, &rx_descriptor );
+	//alt_printf( "again3 \n" );
+}
+void extract_frame (unsigned char *data)
+{
+	unsigned char rx_dest_addr[6];
+	unsigned char rx_sour_addr[6];
+	unsigned char rx_ether_len[2];
+	unsigned char ip_packet[1024-14];
+//  The Destination MAC address
+	printf("Destination MAC address: ");
+	int p=2;//first two bytes are zero padding
+	int j,i;
+	for( i = p; i < p+sizeof(rx_dest_addr); i++){
+		j = i-p;
+		rx_dest_addr[j]=data[i];
+		printf("%x ",rx_dest_addr[j]);
+	} printf("\n");
+	p = p+6;
+
+//  The Source MAC address
+	printf("Source MAC address: ");
+	for( i = p; i < p+sizeof(rx_sour_addr); i++ ){
+		j = i-p;
+		rx_sour_addr[j]=data[i];
+		printf("%x ",rx_sour_addr[j]);
+	} printf("\n");
+	p = p+6;
+//  The Length
+	printf("Length: ");
+	for( i = p; i < p+sizeof(rx_ether_len); i++ ){
+		j = i-p;
+		rx_ether_len[j]=data[i];
+		printf("%x ",rx_ether_len[j]);
+	} printf("\n");
+	p = p+2;
+	unsigned int rx_len;
+	rx_len = 256* (int)rx_ether_len[0] + (int)rx_ether_len[1];
+	p=p+rx_len; //Size of the payload ip+tcp headers + data
+	//printf("Length in Decimal: %d \n",rx_len);
+
+	// unsigned char * ip_packet = (unsigned char *)malloc(rx_ether_len * sizeof(unsigned char));
+	// memcpy(ip_packet, rx_frame+14, rx_ether_len * sizeof(unsigned char)); // 16 is ether_header from app
+	for( i = 0; i<rx_len;i++)
+	{
+		ip_packet[i]=data[i+16];
+	}
+	/*for( i = p; i < sizeof(rx_frame); i++ ){
+		j = i-p;
+		ip_packet[j]=rx_frame[i];
+	} printf("\n");*/
+
+	rx_ip_packet(ip_packet,rx_len);
+
+}
+
+void rx_ip_packet (unsigned char *data, int size)
+{
+	//alt_printf( "inside rx_network layer \n" );
+
+	rx_tcp_segment(data,size);
+	//alt_printf( "again \n" );
+
+}
+
+void rx_tcp_segment (unsigned char *data, int size)
+{
+	//alt_printf( "inside rx_transport layer \n" );
+	//alt_printf( "DATA: %s \n", data+16);
+	//alt_printf( "Destination address: %x,%x,%x,%x,%x,%x \n", data[2], data[3], data[4],  data[5],data[6], data[7] );
+	//alt_printf( "Source address: %x,%x,%x,%x,%x,%x \n", data[8],data[9], data[10],  data[11], data[12], data[13] );
+	unsigned char rx_tcp_seqnum[4]={}; //Sequence number
+	unsigned char rx_tcp_acknum[4]={};
+	unsigned char rx_tcp_checksum[2]={};
+	unsigned char rx_tcp_flags[2]={}; //first one is syn, second one is ack
+
+	unsigned char rx_data[size-12];
+	int p=0;
+	int j;
+	int i;
+	printf("Sequence Number ");
+	for( i = p; i < p+sizeof(rx_tcp_seqnum); i++ ){
+		j = i-p;
+		rx_tcp_seqnum[j]=data[i];
+		printf("%x ",rx_tcp_seqnum[j]);
+	} printf("\n");
+	p = p+sizeof(rx_tcp_seqnum);
+
+	printf("Acknowledgment Number ");
+	for( i = p; i < p+sizeof(rx_tcp_acknum); i++ ){
+		j = i-p;
+		rx_tcp_acknum[j]=data[i];
+		printf("%x ",rx_tcp_acknum[j]);
+	} printf("\n");
+	p = p+sizeof(rx_tcp_acknum);
+
+	printf("Check Sum ");
+	for( i = p; i < p+sizeof(rx_tcp_checksum); i++ ){
+		j = i-p;
+		rx_tcp_checksum[j]=data[i];
+		printf("%x ",rx_tcp_checksum[j]);
+	} printf("\n");
+	p = p+sizeof(rx_tcp_checksum);
+
+	printf("TCP Flags ");
+	for( i = p; i < p+sizeof(rx_tcp_flags); i++ ){
+		j = i-p;
+		rx_tcp_flags[j]=data[i];
+		printf("%x ",rx_tcp_flags[j]);
+	} printf("\n");
+	p = p+sizeof(rx_tcp_flags);
+
+	printf("Data: ");
+	for(i = p; i < p+sizeof(rx_data); i++ ){
+		j = i-p;
+		rx_data[j]=data[i];
+		printf("%c ",rx_data[j]);
+	} printf("\n");
+	// Acknowledge
+	if(rx_tcp_flags[1]==0)
+	{
+		printf("\n Sending Acknowledgment \n");
+		unsigned char tx_tcp_acknum[4]={0,0,0,rx_tcp_seqnum[3]+1};
+		unsigned char tx_tcp_seqnum[4]={0,0,0,0}; //Sequence number
+		// Rest of the tcp
+		unsigned char tx_tcp_checksum[2]={0,6};
+		unsigned char tx_tcp_flags[2]={0,1}; //first one is syn, second one is ack
+		unsigned char tx_header[12];
+		i=0;
+		j=0;
+			for(j=0;j<sizeof(tx_tcp_seqnum);j++)
+			{
+				tx_header[i]=tx_tcp_seqnum[j];
+				i++;
+			}
+			for( j=0;j<sizeof(tx_tcp_acknum);j++)
+			{
+				tx_header[i]=tx_tcp_acknum[j];
+				i++;
+			}
+
+			for( j=0;j<sizeof(tx_tcp_checksum);j++)
+			{
+				tx_header[i]=tx_tcp_checksum[j];
+				i++;
+			}
+			for( j=0;j<sizeof(tx_tcp_flags);j++)
+			{
+				tx_header[i]=tx_tcp_flags[j];
+				i++;
+			}
+
+		tx_ip_packet(tx_header, sizeof(tx_header));
+	}
+}
+
+
+void tx_app ()
+{
+	alt_printf( "Type your message\n" );
+	char string[16];
+
+			fgets(string,16,stdin);
+			//while (string[i] != EOF || i<=3)
+	//int i = 0;
+	/*while(string[i]!='\n')
+	{
+		 i = i + 1;
+		 scanf("%s", &string[i]);
+	}*/
+	//alt_printf( "hi\n" );
+
+	//unsigned char * tx_frame = (unsigned char *)malloc(27 * sizeof(unsigned char));
+	//memcpy(tx_frame, tx_header, 16 * sizeof(unsigned char)); // copy 4 floats from x to total[0]...total[3]
+	//memcpy(tx_frame + 16, string, 4 * sizeof(unsigned char));
+	alt_printf("Sent Message \n");
+	tx_tcp_segment((unsigned char *)string, sizeof(string));
+	//alt_printf( "end of create frame \n" );
+}
+
+void tx_tcp_segment (unsigned char *data, int size)
+{
+	//alt_printf( "inside tx_transport layer \n" );
+
+	// Ack/Seq number
+    seq_num++;
+	unsigned char tx_tcp_acknum[4]={0,0,0,0};
+	unsigned char tx_tcp_seqnum[4]={0,0,0,seq_num}; //Sequence number
+	// Rest of the tcp
+	unsigned char tx_tcp_checksum[2]={0,6};
+	unsigned char tx_tcp_flags[2]={0,0}; //first one is syn, second one is ack
+	unsigned char tx_header[size+12];
+	int i=0;
+	int j;
+		for(j=0;j<sizeof(tx_tcp_seqnum);j++)
+		{
+			tx_header[i]=tx_tcp_seqnum[j];
+			i++;
+		}
+		for( j=0;j<sizeof(tx_tcp_acknum);j++)
+		{
+			tx_header[i]=tx_tcp_acknum[j];
+			i++;
+		}
+
+		for( j=0;j<sizeof(tx_tcp_checksum);j++)
+		{
+			tx_header[i]=tx_tcp_checksum[j];
+			i++;
+		}
+		for( j=0;j<sizeof(tx_tcp_flags);j++)
+		{
+			tx_header[i]=tx_tcp_flags[j];
+			i++;
+		}
+		for( j=0;j<size;j++)
+		{
+			tx_header[i]=data[j];
+			i++;
+		}
+
+
+	//printf( "segment size %d \n", (int) sizeof(tx_header));
+
+
+	tx_ip_packet(tx_header, sizeof(tx_header));
+}
+void tx_ip_packet (unsigned char *data, int size)
+{
+	//alt_printf( "inside tx_network layer \n" );
+	create_frame(data, size);
+}
+
+void create_frame (unsigned char *data, int size)
+{
+	/*unsigned char * tx_frame = (unsigned char *)malloc(80 * sizeof(unsigned char));
+    memcpy(tx_frame, tx_header, 16 * sizeof(unsigned char)); // copy 4 floats from x to total[0]...total[3]
+    memcpy(tx_frame + 16, data, 64 * sizeof(unsigned char));*/
+	unsigned char tx_dest_addr[8]={0x00, 0x00, 0x17, 0x23, 0x1C, 0x00, 0xCB, 0x4A}; /*Destination Address*/
+	unsigned char tx_sour_addr[6]={0x17, 0x23, 0x1C, 0x01, 0xCB, 0x4A}; /*Source Address*/
+	unsigned char tx_ether_len[2];
+	//unsigned char tx_ether_payload[]=data;
+	unsigned char ether_header[size+16];
+	//printf( "eth header size is %d \n", (int)sizeof(ether_header ));
+	//printf( "eth payload size is %d \n", (int)sizeof(data));
+	//unsigned char tx_ether_crc[4]={0x29,0x13,0x10,0x01};
+	int a = size;
+	getOct(a,tx_ether_len,2); //Convert integer to Octets
+	int i=0;
+	int j;
+	for(j=0;j<sizeof(tx_dest_addr);j++)
+	{
+		ether_header[i]=tx_dest_addr[j];
+		i++;
+	}
+	for(j=0;j<sizeof(tx_sour_addr);j++)
+	{
+		ether_header[i]=tx_sour_addr[j];
+		i++;
+	}
+	for(j=0;j<sizeof(tx_ether_len);j++)
+	{
+		ether_header[i]=tx_ether_len[j];
+		i++;
+	}
+	for(j=0;j<size;j++)
+	{
+		ether_header[i]=data[j];
+		i++;
+	}
+
+	//printf( "frame size is %d \n", (int)sizeof(ether_header) );
+
+    tx_ethernet_frame (ether_header, sizeof(ether_header));
+}
+
+
+void tx_ethernet_frame (unsigned char *data, int size)
+{
+	//alt_printf( "inside link layer \n" );
+	//alt_printf( "frame: %s \n", data+16 );
+	alt_avalon_sgdma_construct_mem_to_stream_desc(&tx_descriptor, &tx_descriptor_end, (alt_u32 *)data, size, 0, 1, 1, 0);
+	// Set up non-blocking transfer of sgdma transmit descriptor
+	alt_avalon_sgdma_do_async_transfer( sgdma_tx_dev, &tx_descriptor );
+		 //Wait until receive descriptor transfer is complete
+	while (alt_avalon_sgdma_check_descriptor_status(&tx_descriptor) != 0)
+			;
+	//alt_printf( "bye \n" );
+}
+
+
+void getOct(unsigned long int a,unsigned char *oct,int len)
+{
+	int i;
+    for( i=len;i;i--){
+     *(oct+i-1) = (a>>(len-i)*8) & 255;
+    }
+}
+
+
+
+
+
